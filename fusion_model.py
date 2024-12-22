@@ -598,8 +598,11 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
     for epoch in range(n_epochs // 2):
         model.train()
         total_metrics = {
-            'mse': 0, 'direction': 0, 'smoothness': 0,
-            'mcao_reg': 0, 'group_consistency': 0
+            'mse': 0,
+            'direction': 0, 
+            'smoothness': 0,
+            'feature_reg': 0,     # 添加这个键
+            'group_consistency': 0
         }
         
         pbar = tqdm(train_loader, desc=f'Fusion Stage 1 - Epoch {epoch+1}/{n_epochs//2}')
@@ -722,8 +725,9 @@ def train_one_epoch(model, pbar, optimizer, scheduler, criterion, writer,
         optimizer.step()
         scheduler.step()
         
+        # 确保metrics的键与total_metrics一致
         for k, v in metrics.items():
-            if not torch.isnan(torch.tensor(v)):
+            if k in total_metrics and not torch.isnan(torch.tensor(v)):
                 total_metrics[k] += v
         
         valid_metrics = {
@@ -1010,10 +1014,10 @@ class ATLASCNNFusion(nn.Module):
         # MCAO特征提取
         mcao_features, memory_term = self.mcao(x)
         if torch.isnan(mcao_features).any() or torch.isnan(mcao_features).any():
-            print("NaN detected in MCAO/LAP features")
+            print("NaN detected in MCAO features")
             return None, None, None
             
-        # 剩余的forward逻辑与原来类似,但需要传递更多信息
+        # 初始化LSTM状态
         h = torch.zeros(batch_size, self.hidden_dim, device=x.device)
         c = torch.zeros(batch_size, self.hidden_dim, device=x.device)
         
@@ -1082,7 +1086,7 @@ class ATLASCNNFusion(nn.Module):
                 print(f"NaN detected in market_impact at step {t}")
                 return None, None, None
                 
-            # 最终特征组合
+           # 最终特征组合
             combined = fusion_weight * h_enhanced + (1 - fusion_weight) * current_cnn
             combined = combined * market_impact
             
@@ -1099,9 +1103,10 @@ class ATLASCNNFusion(nn.Module):
             combined_features.append(combined)
         
         predictions = torch.stack(outputs, dim=1)
-        features = torch.stack(combined_features, dim=1)
+        combined_features = torch.stack(combined_features, dim=1)
         
-        return predictions, mcao_features, combined_features, memory_term, coupling_term
+        # 只返回调用处需要的三个值
+        return predictions, mcao_features, combined_features
 
 # 训练函数
 def train_fusion_model(model, train_loader, val_loader, 
@@ -1588,7 +1593,7 @@ def main():
         val_loader=val_loader,
         cnn_state_dict='checkpoints/cnn/best_model.pt',
         lstm_state_dict='checkpoints/lstm/best_model.pt',
-        n_epochs=1,
+        n_epochs=2,
         device=device,
         learning_rate=0.0001,
         checkpoint_dir='checkpoints/fusion'

@@ -85,23 +85,34 @@ class EnhancedCombinedLoss(nn.Module):
     def __init__(self, alpha=0.05, beta=0.9, gamma=0, delta=0.05, epsilon=0,
                  memory_weight=0.1, coupling_weight=0.1):
         super().__init__()
-        # 保留原有的权重
         self.alpha = alpha   # MSE权重
         self.beta = beta     # 方向预测权重
         self.gamma = gamma   # 连续性权重
         self.delta = delta   # 特征正则化权重
         self.epsilon = epsilon # 特征组一致性权重
+        self.memory_weight = memory_weight
+        self.coupling_weight = coupling_weight
         
-        # 添加MCAO特有的权重
-        self.memory_weight = memory_weight    # 记忆项权重
-        self.coupling_weight = coupling_weight # 耦合项权重
+    def _compute_group_consistency(self, group_features):
+        """计算特征组内的一致性损失"""
+        consistency_loss = 0
+        for i in range(group_features.size(1)):  # 遍历每个时间步
+            # 获取当前时间步的特征
+            time_step_features = group_features[:, i, :]
+            # 计算均值
+            mean_feature = time_step_features.mean(dim=-1, keepdim=True)
+            # 计算与均值的差异
+            consistency_loss += torch.mean(
+                torch.abs(time_step_features - mean_feature)
+            )
+        # 对时间步取平均
+        return consistency_loss / group_features.size(1)
         
-    def forward(self, predictions, targets, prev_price, features, group_features,
-               memory_term=None, coupling_term=None):
-        # 保留原有的损失计算
+    def forward(self, predictions, targets, prev_price, features, group_features):
+        # 计算基础MSE损失
         mse_loss = F.mse_loss(predictions[:, -1, :], targets)
         
-        # 方向预测损失
+        # 计算方向预测损失
         pred_diff = predictions[:, -1, :] - prev_price.unsqueeze(-1)
         target_diff = targets - prev_price.unsqueeze(-1)
         direction_loss = F.binary_cross_entropy_with_logits(
@@ -109,39 +120,32 @@ class EnhancedCombinedLoss(nn.Module):
             (target_diff > 0).float()
         )
         
-        # 连续性损失
+        # 计算连续性损失
         smoothness_loss = torch.mean(torch.abs(
             predictions[:, -1, :] - prev_price.unsqueeze(-1)
         ))
-        
+        if smoothness_loss > 0.5:  # 当平滑度超过阈值时增加惩罚
+            smoothness_loss *= 1.5
+            
         # 特征正则化
         feature_reg = torch.mean(torch.abs(features))
         
         # 特征组一致性损失
         group_consistency_loss = self._compute_group_consistency(group_features)
         
-        # 添加MCAO特有的损失项
-        mcao_loss = 0
-        if memory_term is not None:
-            mcao_loss += self.memory_weight * torch.mean(torch.abs(memory_term))
-        if coupling_term is not None:
-            mcao_loss += self.coupling_weight * torch.mean(torch.abs(coupling_term))
-            
         # 组合所有损失
         total_loss = (self.alpha * mse_loss +
                      self.beta * direction_loss +
                      self.gamma * smoothness_loss +
                      self.delta * feature_reg +
-                     self.epsilon * group_consistency_loss +
-                     mcao_loss)
+                     self.epsilon * group_consistency_loss)
         
         return total_loss, {
             'mse': mse_loss.item(),
             'direction': direction_loss.item(),
             'smoothness': smoothness_loss.item(),
             'feature_reg': feature_reg.item(),
-            'group_consistency': group_consistency_loss.item(),
-            'mcao': mcao_loss.item() if mcao_loss > 0 else 0
+            'group_consistency': group_consistency_loss.item()
         }
 
 def train_enhanced_model(model, train_loader, val_loader, n_epochs,
