@@ -208,54 +208,125 @@ class LaplacianStockLayer(nn.Module):
         return output
         
 # multiprocessing.set_start_method('spawn', force=True)
-class StockLSTMCell(nn.Module):
-    def __init__(self, input_size, hidden_size):
+class EnhancedMCAOLSTMCell(nn.Module):
+    def __init__(self, input_size, hidden_size, gamma_order=0.5):
         super().__init__()
         self.hidden_size = hidden_size
         self.input_size = input_size
         
-        # 标准LSTM门
-        self.lstm = nn.LSTMCell(hidden_size, hidden_size)  # 输入和隐藏都是hidden_size
+        # MCAO组件
+        self.mcao = MCAO(input_size, gamma_order=gamma_order)
         
-        # 修正投影层维度：从input_size到hidden_size
-        self.indicator_projection = nn.Sequential(
-            nn.Linear(input_size, hidden_size),  # 输入维度是input_size
-            nn.ReLU()
+        # LSTM基础门控制
+        self.input_gate = nn.Linear(input_size + hidden_size * 2, hidden_size)
+        self.forget_gate = nn.Linear(input_size + hidden_size * 2, hidden_size)
+        self.cell_gate = nn.Linear(input_size + hidden_size * 2, hidden_size)
+        self.output_gate = nn.Linear(input_size + hidden_size * 2, hidden_size)
+        
+        # MCAO特征融合
+        self.mcao_proj = nn.Linear(input_size, hidden_size)
+        
+        # 记忆整合门
+        self.memory_gate = nn.Linear(hidden_size * 2, hidden_size)
+        
+        # 全局状态调制
+        self.global_modulation = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x, h_prev, c_prev):
+        batch_size = x.size(0)
+        
+        # 1. 计算MCAO特征和记忆项
+        mcao_features, memory_term = self.mcao(x.unsqueeze(1))
+        mcao_features = mcao_features.squeeze(1)
+        memory_term = memory_term.squeeze(1)
+        
+        # 2. 投影MCAO特征
+        mcao_proj = self.mcao_proj(mcao_features)
+        
+        # 3. 合并输入
+        combined = torch.cat([x, h_prev, mcao_proj], dim=1)
+        
+        # 4. 计算门控值
+        i = torch.sigmoid(self.input_gate(combined))
+        f = torch.sigmoid(self.forget_gate(combined))
+        g = torch.tanh(self.cell_gate(combined))
+        o = torch.sigmoid(self.output_gate(combined))
+        
+        # 5. 整合MCAO记忆项
+        memory_gate = torch.sigmoid(self.memory_gate(torch.cat([h_prev, mcao_proj], dim=1)))
+        mcao_memory = self.mcao_proj(memory_term)
+        
+        # 6. 更新单元状态
+        c_next = f * c_prev + i * g + memory_gate * mcao_memory
+        
+        # 7. 全局状态调制
+        global_weight = self.global_modulation(mcao_features)
+        h_next = o * torch.tanh(c_next) * global_weight
+        
+        return h_next, c_next, mcao_features
+
+class MCAOEnhancedLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers=1):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        
+        # MCAO增强的LSTM层
+        self.lstm_cells = nn.ModuleList([
+            EnhancedMCAOLSTMCell(
+                input_size if i == 0 else hidden_size,
+                hidden_size
+            ) for i in range(num_layers)
+        ])
+        
+        # 输出预测层
+        self.predictor = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size // 2, 1)
         )
         
-        # 技术指标门和事件门保持不变
-        self.indicator_gate = nn.Linear(hidden_size * 2, hidden_size)
-        self.event_gate = nn.Linear(hidden_size * 2, hidden_size)
-    
-    def forward(self, x, h_prev, c_prev, indicators, event_impact):
-        """
-        参数:
-        x: [batch_size, hidden_size]
-        h_prev, c_prev: [batch_size, hidden_size]
-        indicators: [batch_size, input_size]
-        event_impact: [batch_size, hidden_size]
-        """
-        # 检查输入维度
-        assert x.size(-1) == self.hidden_size, f"Expected x dim {self.hidden_size}, got {x.size(-1)}"
-        assert indicators.size(-1) == self.input_size, f"Expected indicators dim {self.input_size}, got {indicators.size(-1)}"
+    def forward(self, x):
+        batch_size, seq_len, _ = x.shape
+        device = x.device
         
-        # 基础LSTM步骤
-        h_next, c_next = self.lstm(x, (h_prev, c_prev))
+        # 初始化隐藏状态
+        h_states = [torch.zeros(batch_size, self.hidden_size, device=device) 
+                   for _ in range(self.num_layers)]
+        c_states = [torch.zeros(batch_size, self.hidden_size, device=device) 
+                   for _ in range(self.num_layers)]
         
-        # 将indicators投影到hidden_size维度
-        indicators_hidden = self.indicator_projection(indicators)
+        outputs = []
+        mcao_features_seq = []
         
-        # 技术指标整合
-        indicator_combined = torch.cat([h_next, indicators_hidden], dim=-1)
-        indicator_gate = torch.sigmoid(self.indicator_gate(indicator_combined))
-        h_next = h_next * indicator_gate + indicators_hidden * (1 - indicator_gate)
+        for t in range(seq_len):
+            layer_input = x[:, t]
+            
+            # 逐层处理
+            for layer in range(self.num_layers):
+                h_next, c_next, mcao_features = self.lstm_cells[layer](
+                    layer_input, h_states[layer], c_states[layer]
+                )
+                
+                h_states[layer] = h_next
+                c_states[layer] = c_next
+                layer_input = h_next
+                
+                if layer == 0:
+                    mcao_features_seq.append(mcao_features)
+            
+            # 生成预测
+            pred = self.predictor(h_states[-1])
+            outputs.append(pred)
+            
+        predictions = torch.stack(outputs, dim=1)
+        mcao_features_seq = torch.stack(mcao_features_seq, dim=1)
         
-        # 事件影响整合
-        event_combined = torch.cat([h_next, event_impact], dim=-1)
-        event_gate = torch.sigmoid(self.event_gate(event_combined))
-        h_next = h_next * event_gate + event_impact * (1 - event_gate)
-        
-        return h_next, c_next
+        return predictions, mcao_features_seq
 
 class FeatureGroupLayer(nn.Module):
     def __init__(self, group_features, hidden_dim=64):  # 添加hidden_dim参数
@@ -352,7 +423,7 @@ class EnhancedStockPredictor(nn.Module):
         )
         
         # LSTM - 注意维度设置
-        self.lstm = StockLSTMCell(
+        self.lstm = EnhancedMCAOLSTMCell(
             input_size=input_dim,    # 原始特征维度
             hidden_size=hidden_dim   # 隐藏层维度
         )

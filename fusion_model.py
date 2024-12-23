@@ -10,10 +10,10 @@ import numpy as np
 import pandas as pd
 import pickle
 from CNN import ResidualFinancialBlock, EnhancedStockDataset
-from model import StockLSTMCell, EventProcessor, MCAO, prepare_feature_groups
 from train import EnhancedCombinedLoss, train_enhanced_model, generate_event_data#, combine_stock_data
 from data import load_data_from_csv, download_and_prepare_data
 from sklearn.model_selection import train_test_split
+from model import EnhancedMCAOLSTMCell, EventProcessor, MCAO, prepare_feature_groups, MCAOEnhancedLSTM
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
@@ -116,7 +116,7 @@ class LSTMBranch(nn.Module):
         self.hidden_dim = hidden_dim
         
         self.input_proj = nn.Linear(input_dim, hidden_dim)
-        self.atlas = StockLSTMCell(input_dim, hidden_dim)
+        self.atlas = EnhancedMCAOLSTMCell(input_dim, hidden_dim)
         self.event_processor = EventProcessor(
             event_dim=event_dim,
             hidden_dim=hidden_dim,
@@ -312,31 +312,50 @@ class LSTMCombinedLoss(nn.Module):
             'mcao_reg': mcao_reg.item()
         }
 
-def train_lstm_branch(model, train_loader, val_loader, 
-                     n_epochs=30, device='cuda', learning_rate=0.0001,
-                     checkpoint_dir='checkpoints/lstm'):
-    """训练LSTM分支"""
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    writer = SummaryWriter('runs/lstm_branch')
+def train_mcao_lstm(model, train_loader, val_loader, 
+                    n_epochs=30, device='cuda', learning_rate=0.0001,
+                    checkpoint_dir='checkpoints/mcao_lstm'):
+    """训练MCAO增强的LSTM模型
     
-    # 调整loss权重，考虑到数据规模
+    Args:
+        model: MCAO-LSTM模型实例
+        train_loader: 训练数据加载器 
+        val_loader: 验证数据加载器
+        n_epochs: 训练轮数
+        device: 训练设备
+        learning_rate: 学习率
+        checkpoint_dir: 模型保存路径
+    """
+    import os
+    from torch.utils.tensorboard import SummaryWriter
+    
+    # 创建检查点目录
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # 初始化tensorboard
+    writer = SummaryWriter('runs/mcao_lstm')
+    
+    # 损失函数
     criterion = LSTMCombinedLoss(
-        alpha=0.4,    # MSE权重降低
-        beta=0.4,     # 增加方向预测权重
+        alpha=0.4,    # MSE权重
+        beta=0.4,     # 方向预测权重
         gamma=0.1,    # 平滑度权重
         delta=0.1     # MCAO正则化权重
     )
     
+    # 优化器
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=learning_rate,
         weight_decay=0.01
     )
     
+    # 学习率调度器
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=5, T_mult=2, eta_min=1e-6
     )
     
+    # 初始化训练状态
     best_val_loss = float('inf')
     patience = 20
     patience_counter = 0
@@ -344,6 +363,7 @@ def train_lstm_branch(model, train_loader, val_loader,
     global_step = 0
     
     for epoch in range(n_epochs):
+        # 训练阶段
         model.train()
         total_metrics = {
             'mse': 0, 'direction': 0, 'smoothness': 0,
@@ -351,21 +371,18 @@ def train_lstm_branch(model, train_loader, val_loader,
         }
         epoch_loss = 0
         
-        train_pbar = tqdm(train_loader, desc=f'LSTM Epoch {epoch+1}/{n_epochs}')
+        train_pbar = tqdm(train_loader, desc=f'MCAO-LSTM Epoch {epoch+1}/{n_epochs}')
         for batch_idx, batch in enumerate(train_pbar):
             sequence = batch['sequence'].to(device)
-            events = batch['events'].to(device)
-            time_distances = batch['time_distances'].to(device)
             target = batch['target'].to(device)
             current_price = batch['current_price'].to(device)
             
             optimizer.zero_grad()
             
-            # try:
-            predictions, _, mcao_features = model(
-                sequence, events, time_distances
-            )
-
+            # 前向传播
+            predictions, mcao_features = model(sequence)
+            
+            # 计算损失
             loss, metrics = criterion(
                 predictions,
                 target,
@@ -373,41 +390,30 @@ def train_lstm_branch(model, train_loader, val_loader,
                 mcao_features
             )
             
+            # 检查NaN
             if torch.isnan(loss):
                 print("NaN loss detected!")
                 continue
             
+            # 反向传播
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             
             optimizer.step()
             scheduler.step()
             
+            # 更新指标
             epoch_loss += loss.item()
+            for k, v in metrics.items():
+                if not torch.isnan(torch.tensor(v)):
+                    total_metrics[k] += v
             
             # 记录训练指标
             writer.add_scalar('Train/Loss', loss.item(), global_step)
             writer.add_scalar('Train/LearningRate', 
                             optimizer.param_groups[0]['lr'], global_step)
             
-            # 记录特征统计信息
-            writer.add_scalar('Train/PredictionMean', 
-                            predictions.mean().item(), global_step)
-            writer.add_scalar('Train/PredictionStd', 
-                            predictions.std().item(), global_step)
-            writer.add_scalar('Train/MCAOMean', 
-                            mcao_features.mean().item(), global_step)
-            writer.add_scalar('Train/MCAOStd', 
-                            mcao_features.std().item(), global_step)
-            
-            for k, v in metrics.items():
-                if not torch.isnan(torch.tensor(v)):
-                    total_metrics[k] += v
-                    writer.add_scalar(f'Train/{k}', v, global_step)
-            
-            global_step += 1
-            
-            # 更新进度条显示
+            # 更新进度条
             avg_loss = epoch_loss / (batch_idx + 1)
             current_metrics = {
                 k: v / (batch_idx + 1)
@@ -417,28 +423,16 @@ def train_lstm_branch(model, train_loader, val_loader,
                 'loss': f'{avg_loss:.4f}',
                 **{k: f'{v:.4f}' for k, v in current_metrics.items()}
             })
-                
-            # except RuntimeError as e:
-            #     print(f"Error during training: {e}")
-            #     continue
-                
-            # except ValueError as e:
-            #     print(f"ValueError during training: {e}")
-            #     continue
-                
-            # except Exception as e:
-            #     print(f"Unexpected error during training: {e}")
-            #     import traceback
-            #     traceback.print_exc()
-            #     continue
-
+            
+            global_step += 1
+        
         # 打印训练阶段摘要
         print(f"\nEpoch {epoch+1} Training Summary:")
         print(f"Average Loss: {epoch_loss/len(train_loader):.4f}")
         for k, v in total_metrics.items():
             print(f"{k}: {v/len(train_loader):.4f}")
-            
-        # Validation
+        
+        # 验证阶段
         model.eval()
         val_loss = 0
         val_metrics = {k: 0 for k in total_metrics.keys()}
@@ -447,48 +441,43 @@ def train_lstm_branch(model, train_loader, val_loader,
         
         with torch.no_grad():
             val_pbar = tqdm(val_loader, desc='Validation')
-            for batch in val_pbar:
+            for batch_idx, batch in enumerate(val_pbar):
                 sequence = batch['sequence'].to(device)
-                events = batch['events'].to(device)
-                time_distances = batch['time_distances'].to(device)
                 target = batch['target'].to(device)
                 current_price = batch['current_price'].to(device)
                 
-                try:
-                    predictions, _, mcao_features = model(
-                        sequence, events, time_distances
-                    )
-                    
-                    loss, metrics = criterion(
-                        predictions,
-                        target,
-                        current_price,
-                        mcao_features
-                    )
-                    
-                    val_loss += loss.item()
-                    for k, v in metrics.items():
-                        if not torch.isnan(torch.tensor(v)):
-                            val_metrics[k] += v
-                            
-                    # 收集预测和目标值用于后续分析
-                    val_predictions.append(predictions[:, -1].cpu())
-                    val_targets.append(target.cpu())
-                    
-                    # 更新验证进度条
-                    avg_val_loss = val_loss / (len(val_pbar))
-                    current_val_metrics = {
-                        k: v / (len(val_pbar))
-                        for k, v in val_metrics.items()
-                    }
-                    val_pbar.set_postfix({
-                        'val_loss': f'{avg_val_loss:.4f}',
-                        **{f'val_{k}': f'{v:.4f}' for k, v in current_val_metrics.items()}
-                    })
-                    
-                except Exception as e:
-                    print(f"Error during validation: {e}")
-                    continue
+                # 前向传播
+                predictions, mcao_features = model(sequence)
+                
+                # 计算损失
+                loss, metrics = criterion(
+                    predictions,
+                    target,
+                    current_price,
+                    mcao_features
+                )
+                
+                val_loss += loss.item()
+                
+                # 更新验证指标
+                for k, v in metrics.items():
+                    if not torch.isnan(torch.tensor(v)):
+                        val_metrics[k] += v
+                
+                # 收集预测结果
+                val_predictions.append(predictions[:, -1].cpu())
+                val_targets.append(target.cpu())
+                
+                # 更新进度条
+                avg_val_loss = val_loss / (batch_idx + 1)
+                current_val_metrics = {
+                    k: v / (batch_idx + 1)
+                    for k, v in val_metrics.items()
+                }
+                val_pbar.set_postfix({
+                    'val_loss': f'{avg_val_loss:.4f}',
+                    **{f'val_{k}': f'{v:.4f}' for k, v in current_val_metrics.items()}
+                })
         
         # 计算验证指标
         val_loss /= len(val_loader)
@@ -502,6 +491,7 @@ def train_lstm_branch(model, train_loader, val_loader,
         writer.add_scalar('Validation/PredictionStd', 
                          val_predictions.std().item(), epoch)
         
+        # 打印验证结果
         print(f"\nValidation Results:")
         print(f"Loss: {val_loss:.4f}")
         for k, v in val_metrics.items():
@@ -509,7 +499,7 @@ def train_lstm_branch(model, train_loader, val_loader,
             print(f"Val {k}: {v_avg:.4f}")
             writer.add_scalar(f'Validation/{k}', v_avg, epoch)
         
-        # Early stopping check
+        # 早停检查
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_model_state = model.state_dict()
@@ -529,6 +519,7 @@ def train_lstm_branch(model, train_loader, val_loader,
                 print("\nEarly stopping triggered!")
                 break
     
+    # 加载最佳模型
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
         print("Loaded best model from checkpoint")
@@ -540,15 +531,27 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
                                  cnn_state_dict, lstm_state_dict,
                                  n_epochs=50, device='cuda', learning_rate=0.0001,
                                  checkpoint_dir='checkpoints/fusion'):
-    """Progressive training for fusion model"""
+    """MCAO增强版fusion model的渐进式训练
+    
+    Args:
+        model: ATLASCNNFusion 模型实例
+        train_loader: 训练数据加载器
+        val_loader: 验证数据加载器 
+        cnn_state_dict: CNN预训练权重路径
+        lstm_state_dict: LSTM预训练权重路径
+        n_epochs: 训练轮数
+        device: 训练设备
+        learning_rate: 学习率
+        checkpoint_dir: 模型保存路径
+    """
     os.makedirs(checkpoint_dir, exist_ok=True)
     writer = SummaryWriter('runs/fusion_model')
     
     # 加载预训练的权重
     print("Loading pretrained weights...")
-    # 加载CNN分支
+    
+    # 加载CNN分支权重
     cnn_weights = torch.load(cnn_state_dict)['model_state_dict']
-    # Filter and rename CNN weights
     cnn_weights_filtered = {
         k.replace('cnn_branch.', ''): v 
         for k, v in cnn_weights.items() 
@@ -556,20 +559,56 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
     }
     model.cnn_branch.load_state_dict(cnn_weights_filtered)
     
-    # 加载LSTM分支
+    # 加载MCAO-LSTM权重 
     lstm_weights = torch.load(lstm_state_dict)['model_state_dict']
-    # 加载LSTM相关组件的权重
-    model.atlas.load_state_dict({
-        k[6:]: v for k, v in lstm_weights.items() 
-        if k.startswith('atlas.')
-    })
-    model.event_processor.load_state_dict({
-        k[16:]: v for k, v in lstm_weights.items()
-        if k.startswith('event_processor.')
-    })
-    print("Successfully loaded pretrained weights!")
     
-    # 第一阶段：冻结CNN和LSTM分支，只训练融合层
+    # 初始化EnhancedMCAOLSTMCell的权重
+    mcao_lstm_state = {}
+    
+    # MCAO相关权重
+    mcao_state = {
+        k: v for k, v in lstm_weights.items() 
+        if k.startswith('mcao.')
+    }
+    mcao_lstm_state.update(mcao_state)
+    
+    # LSTM基础组件权重
+    lstm_base_state = {
+        k: v for k, v in lstm_weights.items()
+        if any(k.startswith(prefix) for prefix in 
+              ['input_gate.', 'forget_gate.', 'cell_gate.', 'output_gate.'])
+    }
+    mcao_lstm_state.update(lstm_base_state)
+    
+    # 投影层权重
+    proj_state = {
+        k: v for k, v in lstm_weights.items()
+        if k.startswith('mcao_proj.') or k.startswith('memory_gate.') or k.startswith('global_modulation.')
+    }
+    mcao_lstm_state.update(proj_state)
+    
+    # 加载权重到模型
+    try:
+        model.atlas.load_state_dict(mcao_lstm_state, strict=False)
+        print("Successfully loaded MCAO-LSTM weights!")
+    except Exception as e:
+        print(f"Warning: Error loading MCAO-LSTM weights: {e}")
+        print("Will initialize these components randomly")
+    
+    # 加载事件处理器权重
+    try:
+        event_state = {
+            k.replace('event_processor.', ''): v
+            for k, v in lstm_weights.items()
+            if k.startswith('event_processor.')
+        }
+        model.event_processor.load_state_dict(event_state)
+        print("Successfully loaded event processor weights!")
+    except Exception as e:
+        print(f"Warning: Error loading event processor weights: {e}")
+        print("Will initialize event processor randomly")
+    
+    # 第一阶段：冻结CNN和LSTM分支
     for param in model.cnn_branch.parameters():
         param.requires_grad = False
     for param in model.atlas.parameters():
@@ -577,7 +616,10 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
     for param in model.event_processor.parameters():
         param.requires_grad = False
     
+    # 使用增强版损失函数
     criterion = EnhancedCombinedLoss()
+    
+    # 优化器 - 只优化未冻结的参数
     optimizer = torch.optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=learning_rate,
@@ -594,6 +636,7 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
     best_model_state = None
     
     print("Stage 1: Training fusion layers only...")
+    
     # 训练融合层
     for epoch in range(n_epochs // 2):
         model.train()
@@ -601,7 +644,7 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
             'mse': 0,
             'direction': 0, 
             'smoothness': 0,
-            'feature_reg': 0,     # 添加这个键
+            'feature_reg': 0,
             'group_consistency': 0
         }
         
@@ -609,10 +652,10 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
         train_one_epoch(model, pbar, optimizer, scheduler, criterion, writer, 
                        total_metrics, epoch, device)
         
-        # Validation
+        # 验证
         val_loss = validate_model(model, val_loader, criterion, writer, epoch, device)
         
-        # Early stopping check
+        # 早停检查
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_model_state = model.state_dict()
@@ -629,15 +672,18 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
                 print("Early stopping triggered for Stage 1")
                 break
     
-    # 第二阶段：解冻所有层，小学习率微调
+    # 第二阶段：解冻所有层进行微调
     epoch = n_epochs // 2
     print("\nStage 2: Fine-tuning all layers...")
+    
+    # 解冻所有层
     for param in model.parameters():
         param.requires_grad = True
     
+    # 使用较小的学习率
     optimizer = torch.optim.AdamW(
         model.parameters(),
-        lr=learning_rate * 0.1,  # 降低学习率
+        lr=learning_rate * 0.1,
         weight_decay=0.01
     )
     
@@ -647,7 +693,6 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
     
     patience_counter = 0
     best_val_loss = float('inf')
-    
     remaining_epochs = n_epochs - epoch - 1
     
     for epoch in range(remaining_epochs):
@@ -661,11 +706,11 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
         train_one_epoch(model, pbar, optimizer, scheduler, criterion, writer, 
                        total_metrics, epoch + n_epochs//2, device)
         
-        # Validation
+        # 验证
         val_loss = validate_model(model, val_loader, criterion, writer, 
                                 epoch + n_epochs//2, device)
         
-        # Early stopping check
+        # 早停检查
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_model_state = model.state_dict()
@@ -939,7 +984,7 @@ class ATLASCNNFusion(nn.Module):
                 nn.init.constant_(m.bias, 0)
         
         # 其他组件
-        self.atlas = StockLSTMCell(input_dim, hidden_dim)
+        self.atlas = EnhancedMCAOLSTMCell(input_dim, hidden_dim)
         self.event_processor = EventProcessor(
             event_dim=event_dim,
             hidden_dim=hidden_dim,
@@ -1013,7 +1058,7 @@ class ATLASCNNFusion(nn.Module):
             
         # MCAO特征提取
         mcao_features, memory_term = self.mcao(x)
-        if torch.isnan(mcao_features).any() or torch.isnan(mcao_features).any():
+        if torch.isnan(mcao_features).any():
             print("NaN detected in MCAO features")
             return None, None, None
             
@@ -1025,38 +1070,35 @@ class ATLASCNNFusion(nn.Module):
         combined_features = []
         
         for t in range(seq_len):
-            current_x = x[:, t]  # [batch, input_dim]
-            current_cnn = cnn_features[:, t]  # [batch, hidden_dim]
+            current_x = x[:, t]
+            current_cnn = cnn_features[:, t]
             current_events = events[:, t]
             current_distances = time_distances[:, t]
             
-            # 将输入投影到hidden_dim维度
-            projected_x = self.input_proj(current_x)  # [batch, hidden_dim]
-            if torch.isnan(projected_x).any():
-                print(f"NaN detected in projected_x at step {t}")
-                return None, None, None
-                
             # 处理事件影响
             event_impact = self.event_processor(
                 current_events,
                 h,
                 current_distances
             )
+            
+            h, c, mcao_cell_features = self.atlas(
+                current_x,
+                h,
+                c
+            )
+            
+            # 在LSTM之后添加event_impact
+            h = h + event_impact
+
             if torch.isnan(event_impact).any():
                 print(f"NaN detected in event_impact at step {t}")
                 return None, None, None
-                
-            # ATLAS步进 - 使用投影后的x
-            h, c = self.atlas(
-                projected_x,  # 现在是hidden_dim维度
-                h, c,
-                current_x,  # 原始input_dim维度作为indicators
-                event_impact
-            )
+            
             if torch.isnan(h).any() or torch.isnan(c).any():
                 print(f"NaN detected in LSTM state at step {t}")
                 return None, None, None
-                
+            
             # 交叉注意力处理
             h_query = h.unsqueeze(1)
             cnn_kv = current_cnn.unsqueeze(1)
@@ -1086,7 +1128,7 @@ class ATLASCNNFusion(nn.Module):
                 print(f"NaN detected in market_impact at step {t}")
                 return None, None, None
                 
-           # 最终特征组合
+            # 最终特征组合
             combined = fusion_weight * h_enhanced + (1 - fusion_weight) * current_cnn
             combined = combined * market_impact
             
@@ -1105,7 +1147,6 @@ class ATLASCNNFusion(nn.Module):
         predictions = torch.stack(outputs, dim=1)
         combined_features = torch.stack(combined_features, dim=1)
         
-        # 只返回调用处需要的三个值
         return predictions, mcao_features, combined_features
 
 # 训练函数
@@ -1380,21 +1421,20 @@ def main():
     
     # Step 2: 训练LSTM分支
     print("\nStep 2: Training LSTM Branch...")
-    lstm_model = LSTMBranch(
-        input_dim=input_dim,
-        hidden_dim=hidden_dim,
-        event_dim=event_dim,
-        num_event_types=num_event_types
+    model = MCAOEnhancedLSTM(
+        input_size=21,    # 输入特征维度
+        hidden_size=128   # 隐藏层维度
     ).to(device)
-    
-    lstm_model = train_lstm_branch(
-        model=lstm_model,
+
+    # 训练模型
+    trained_model = train_mcao_lstm(
+        model=model,
         train_loader=train_loader,
         val_loader=val_loader,
         n_epochs=30,
         device=device,
         learning_rate=0.0001,
-        checkpoint_dir='checkpoints/lstm'
+        checkpoint_dir='checkpoints/mcao_lstm'
     )
     
     # Step 3: 融合训练
@@ -1413,7 +1453,7 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         cnn_state_dict='checkpoints/cnn/best_model.pt',
-        lstm_state_dict='checkpoints/lstm/best_model.pt',
+        lstm_state_dict='checkpoints/mcao_lstm/best_model.pt',
         n_epochs=50,
         device=device,
         learning_rate=0.0001,
@@ -1498,13 +1538,13 @@ def main():
     # 创建数据加载器
     train_loader = DataLoader(
         train_dataset,
-        batch_size=32,
+        batch_size=512,
         shuffle=True,
         num_workers=4
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=32,
+        batch_size=512,
         shuffle=False,
         num_workers=4
     )
@@ -1526,13 +1566,13 @@ def main():
     #LSTM分支数据加载器
     train_loader_lstm = DataLoader(
         train_dataset,
-        batch_size=480,
+        batch_size=4096,
         shuffle=True,
         num_workers=4
     )
     val_loader_lstm = DataLoader(
         val_dataset,
-        batch_size=480,
+        batch_size=4096,
         shuffle=False,
         num_workers=4
     )
@@ -1542,43 +1582,43 @@ def main():
     
     # Step 1: 训练CNN分支
     print("\nStep 1: Training CNN Branch...")
-    # cnn_model = CNNBranch(
-    #     input_dim=input_dim,
-    #     hidden_dim=hidden_dim
-    # ).to(device)
+    cnn_model = CNNBranch(
+        input_dim=input_dim,
+        hidden_dim=hidden_dim
+    ).to(device)
     
-    # cnn_model = train_cnn_branch(
-    #     model=cnn_model,
-    #     train_loader=train_loader_CNN,
-    #     val_loader=val_loader_CNN,
-    #     n_epochs=1,
-    #     device=device,
-    #     learning_rate=0.0001,
-    #     checkpoint_dir='checkpoints/cnn'
-    # )
+    cnn_model = train_cnn_branch(
+        model=cnn_model,
+        train_loader=train_loader_CNN,
+        val_loader=val_loader_CNN,
+        n_epochs=1,
+        device=device,
+        learning_rate=0.0001,
+        checkpoint_dir='checkpoints/cnn'
+    )
     
     # Step 2: 训练LSTM分支
     print("\nStep 2: Training LSTM Branch...")
-    # lstm_model = LSTMBranch(
-    #     input_dim=input_dim,
-    #     hidden_dim=hidden_dim,
-    #     event_dim=event_dim,
-    #     num_event_types=num_event_types
-    # ).to(device)
-    
-    # lstm_model = train_lstm_branch(
-    #     model=lstm_model,
-    #     train_loader=train_loader_lstm,
-    #     val_loader=val_loader_lstm,
-    #     n_epochs=1,
-    #     device=device,
-    #     learning_rate=0.0001,
-    #     checkpoint_dir='checkpoints/lstm'
-    # )
+    model = MCAOEnhancedLSTM(
+    input_size=21,    # 输入特征维度
+    hidden_size=128   # 隐藏层维度
+    ).to(device)
+
+    # 训练模型
+    trained_model = train_mcao_lstm(
+        model=model,
+        train_loader=train_loader_lstm,
+        val_loader=val_loader_lstm,
+        n_epochs=1,
+        device=device,
+        learning_rate=0.0001,
+        checkpoint_dir='checkpoints/mcao_lstm'
+    )
+
     
     # Step 3: 融合训练
     print("\nStep 3: Progressive Fusion Training...")
-    fusion_model = ATLASCNNFusion(
+    fusion_model = ATLASCNNFusion(  # 这里使用ATLASCNNFusion是正确的
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         event_dim=event_dim,
@@ -1588,12 +1628,12 @@ def main():
     
     # 使用预训练的分支模型进行融合训练
     trained_model = train_fusion_model_progressive(
-        model=fusion_model,
+        model=fusion_model,  # 传入ATLASCNNFusion实例
         train_loader=train_loader,
         val_loader=val_loader,
         cnn_state_dict='checkpoints/cnn/best_model.pt',
-        lstm_state_dict='checkpoints/lstm/best_model.pt',
-        n_epochs=2,
+        lstm_state_dict='checkpoints/mcao_lstm/best_model.pt',
+        n_epochs=50,
         device=device,
         learning_rate=0.0001,
         checkpoint_dir='checkpoints/fusion'
