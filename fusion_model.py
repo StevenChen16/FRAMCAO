@@ -116,7 +116,7 @@ class LSTMBranch(nn.Module):
         self.hidden_dim = hidden_dim
         
         self.input_proj = nn.Linear(input_dim, hidden_dim)
-        self.atlas = EnhancedMCAOLSTMCell(input_dim, hidden_dim)
+        self.framcao = EnhancedMCAOLSTMCell(input_dim, hidden_dim)
         self.event_processor = EventProcessor(
             event_dim=event_dim,
             hidden_dim=hidden_dim,
@@ -160,7 +160,7 @@ class LSTMBranch(nn.Module):
             )
             
             # LSTM步进
-            h, c = self.atlas(
+            h, c = self.framcao(
                 projected_x,
                 h, c,
                 current_x,
@@ -534,7 +534,7 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
     """MCAO增强版fusion model的渐进式训练
     
     Args:
-        model: ATLASCNNFusion 模型实例
+        model: FRAMCAOCNNFusion 模型实例
         train_loader: 训练数据加载器
         val_loader: 验证数据加载器 
         cnn_state_dict: CNN预训练权重路径
@@ -589,7 +589,7 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
     
     # 加载权重到模型
     try:
-        model.atlas.load_state_dict(mcao_lstm_state, strict=False)
+        model.framcao.load_state_dict(mcao_lstm_state, strict=False)
         print("Successfully loaded MCAO-LSTM weights!")
     except Exception as e:
         print(f"Warning: Error loading MCAO-LSTM weights: {e}")
@@ -611,7 +611,7 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
     # 第一阶段：冻结CNN和LSTM分支
     for param in model.cnn_branch.parameters():
         param.requires_grad = False
-    for param in model.atlas.parameters():
+    for param in model.framcao.parameters():
         param.requires_grad = False
     for param in model.event_processor.parameters():
         param.requires_grad = False
@@ -950,7 +950,7 @@ class FusionStockDataset(Dataset):
             'current_price': current_price   # 当前价格
         }
 
-class ATLASCNNFusion(nn.Module):
+class FRAMCAOCNNFusion(nn.Module):
     def __init__(self, input_dim, hidden_dim, event_dim, num_event_types, feature_groups):
         super().__init__()
         self.input_dim = input_dim
@@ -984,7 +984,7 @@ class ATLASCNNFusion(nn.Module):
                 nn.init.constant_(m.bias, 0)
         
         # 其他组件
-        self.atlas = EnhancedMCAOLSTMCell(input_dim, hidden_dim)
+        self.framcao = EnhancedMCAOLSTMCell(input_dim, hidden_dim)
         self.event_processor = EventProcessor(
             event_dim=event_dim,
             hidden_dim=hidden_dim,
@@ -1082,7 +1082,7 @@ class ATLASCNNFusion(nn.Module):
                 current_distances
             )
             
-            h, c, mcao_cell_features = self.atlas(
+            h, c, mcao_cell_features = self.framcao(
                 current_x,
                 h,
                 c
@@ -1157,7 +1157,7 @@ def train_fusion_model(model, train_loader, val_loader,
     训练融合模型的函数
     
     Args:
-        model: ATLASCNNFusion模型实例
+        model: FRAMCAOCNNFusion模型实例
         train_loader: 训练数据加载器
         val_loader: 验证数据加载器
         n_epochs: 训练轮数
@@ -1439,7 +1439,7 @@ def main():
     
     # Step 3: 融合训练
     print("\nStep 3: Progressive Fusion Training...")
-    fusion_model = ATLASCNNFusion(
+    fusion_model = FRAMCAOCNNFusion(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         event_dim=event_dim,
@@ -1618,7 +1618,7 @@ def main():
     
     # Step 3: 融合训练
     print("\nStep 3: Progressive Fusion Training...")
-    fusion_model = ATLASCNNFusion(  # 这里使用ATLASCNNFusion是正确的
+    fusion_model = FRAMCAOCNNFusion(  # 这里使用FRAMCAOCNNFusion是正确的
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         event_dim=event_dim,
@@ -1628,7 +1628,7 @@ def main():
     
     # 使用预训练的分支模型进行融合训练
     trained_model = train_fusion_model_progressive(
-        model=fusion_model,  # 传入ATLASCNNFusion实例
+        model=fusion_model,  # 传入FRAMCAOCNNFusion实例
         train_loader=train_loader,
         val_loader=val_loader,
         cnn_state_dict='checkpoints/cnn/best_model.pt',
