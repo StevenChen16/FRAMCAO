@@ -18,6 +18,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 import torch.multiprocessing as mp
+import argparse
 
 
 # 在第38行左右添加
@@ -1330,19 +1331,94 @@ def train_fusion_model(model, train_loader, val_loader,
     writer.close()
     return model
 
+def get_args():
+    parser = argparse.ArgumentParser(description='FRAMCAO Stock Prediction Model Training')
+    
+    # 基础训练参数
+    parser.add_argument('--cnn_batch_size', type=int, default=2,
+                        help='batch size for CNN training (default: 2)')
+    parser.add_argument('--lstm_batch_size', type=int, default=8192,
+                        help='batch size for LSTM training (default: 8192)')
+    parser.add_argument('--fusion_batch_size', type=int, default=8,
+                        help='batch size for fusion model training (default: 8)')
+    
+    parser.add_argument('--cnn_epochs', type=int, default=1,
+                        help='number of epochs for CNN training (default: 1)')
+    parser.add_argument('--lstm_epochs', type=int, default=1,
+                        help='number of epochs for LSTM training (default: 1)')
+    parser.add_argument('--fusion_epochs', type=int, default=2,
+                        help='number of epochs for fusion training (default: 2)')
+    
+    parser.add_argument('--cnn_lr', type=float, default=0.0001,
+                        help='learning rate for CNN training (default: 0.0001)')
+    parser.add_argument('--lstm_lr', type=float, default=0.0001,
+                        help='learning rate for LSTM training (default: 0.0001)')
+    parser.add_argument('--fusion_lr', type=float, default=0.0001,
+                        help='learning rate for fusion training (default: 0.0001)')
+    
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='device to use for training (default: cuda)')
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help='number of workers for data loading (default: 4)')
+    
+    # 模型架构参数
+    parser.add_argument('--input_dim', type=int, default=21,
+                        help='input dimension (default: 21)')
+    parser.add_argument('--hidden_dim', type=int, default=128,
+                        help='hidden dimension (default: 128)')
+    parser.add_argument('--event_dim', type=int, default=32,
+                        help='event embedding dimension (default: 32)')
+    parser.add_argument('--num_event_types', type=int, default=10,
+                        help='number of event types (default: 10)')
+    
+    # 数据参数
+    parser.add_argument('--start_date', type=str, default='2020-01-01',
+                        help='start date for data (default: 2020-01-01)')
+    parser.add_argument('--end_date', type=str, default='2024-01-01',
+                        help='end date for data (default: 2024-01-01)')
+    parser.add_argument('--val_split', type=float, default=0.2,
+                        help='validation split ratio (default: 0.2)')
+    parser.add_argument('--symbols', type=str, nargs='+', 
+                        default=["AAPL", "MSFT", "GOOGL"],
+                        help='list of stock symbols to train on')
+    
+    # 训练控制参数
+    parser.add_argument('--seed', type=int, default=42,
+                        help='random seed (default: 42)')
+    parser.add_argument('--gradient_clip', type=float, default=0.5,
+                        help='gradient clipping value (default: 0.5)')
+    parser.add_argument('--early_stopping_patience', type=int, default=20,
+                        help='patience for early stopping (default: 20)')
+    
+    # 模型保存参数
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+                        help='directory to save checkpoints (default: checkpoints)')
+    parser.add_argument('--save_freq', type=int, default=5,
+                        help='save checkpoint frequency in epochs (default: 5)')
+    
+    # 分布式训练参数
+    parser.add_argument('--dist_url', type=str, default='tcp://localhost:12355',
+                        help='url used to set up distributed training')
+    parser.add_argument('--dist_backend', type=str, default='nccl',
+                        help='distributed backend')
+    
+    args = parser.parse_args()
+    return args
 
-def main(rank, world_size):
+def main(rank, world_size, args):
     setup(rank, world_size)
     
     # 设置当前GPU
     torch.cuda.set_device(rank)
-    device = torch.device(f'cuda:{rank}')
+    device = torch.device(f'cuda:{rank}' if args.device == 'cuda' else args.device)
         
     # 参数设置
     input_dim = 21  # 输入特征维度
     hidden_dim = 128  # 隐藏层维度
     event_dim = 32  # 事件嵌入维度
     num_event_types = 10  # 事件类型数量
+
+    torch.manual_seed(args.seed)
     
     # 数据准备
     symbols_200 = [# 科技股
@@ -1399,8 +1475,8 @@ def main(rank, world_size):
     events = generate_event_data(data)
     
     # 划分训练集和验证集
-    train_data, val_data = train_test_split(data, test_size=0.2, shuffle=False)
-    train_events, val_events = train_test_split(events, test_size=0.2, shuffle=False)
+    train_data, val_data = train_test_split(data, test_size=args.val_split, shuffle=False)
+    train_events, val_events = train_test_split(events, test_size=args.val_split, shuffle=False)
     
     # 创建数据集
     train_dataset = FusionStockDataset(train_data, train_events)
@@ -1410,7 +1486,7 @@ def main(rank, world_size):
     train_sampler = DistributedSampler(train_dataset)
     train_loader = DataLoader(
         train_dataset,
-        batch_size=8,
+        batch_size=args.fusion_batch_size,
         shuffle=False,
         num_workers=4,
         sampler=train_sampler,
@@ -1427,7 +1503,7 @@ def main(rank, world_size):
     train_sampler_cnn = DistributedSampler(train_dataset)
     train_loader_CNN = DataLoader(
         train_dataset,
-        batch_size=2,
+        batch_size=args.cnn_batch_size,
         shuffle=False,
         num_workers=4,
         sampler=train_sampler_cnn,
@@ -1444,7 +1520,7 @@ def main(rank, world_size):
     train_sampler_lstm = DistributedSampler(train_dataset)
     train_loader_lstm = DataLoader(
         train_dataset,
-        batch_size=8192,
+        batch_size=args.lstm_batch_size,
         shuffle=False,
         num_workers=4,
         sampler=train_sampler_lstm,
@@ -1473,9 +1549,9 @@ def main(rank, world_size):
         model=cnn_model,
         train_loader=train_loader_CNN,
         val_loader=val_loader_CNN,
-        n_epochs=1,
+        n_epochs=args.cnn_epochs,
         device=device,
-        learning_rate=0.0001,
+        learning_rate=args.cnn_lr,
         checkpoint_dir='checkpoints/cnn'
     )
     
@@ -1493,9 +1569,9 @@ def main(rank, world_size):
         model=model,
         train_loader=train_loader_lstm,
         val_loader=val_loader_lstm,
-        n_epochs=1,
+        n_epochs=args.lstm_epochs,
         device=device,
-        learning_rate=0.0001,
+        learning_rate=args.lstm_lr,
         checkpoint_dir='checkpoints/mcao_lstm'
     )
     
@@ -1518,9 +1594,9 @@ def main(rank, world_size):
         val_loader=val_loader,
         cnn_state_dict='checkpoints/cnn/best_model.pt',
         lstm_state_dict='checkpoints/mcao_lstm/best_model.pt',
-        n_epochs=2,
+        n_epochs=args.fusion_epochs,
         device=device,
-        learning_rate=0.0001,
+        learning_rate=args.fusion_lr,
         checkpoint_dir='checkpoints/fusion'
     )
     
@@ -1531,10 +1607,11 @@ def main(rank, world_size):
     )
     
 if __name__ == "__main__":
+    args = get_args()
     world_size = torch.cuda.device_count()
     mp.spawn(
         main,
-        args=(world_size,),
+        args=(world_size, args),
         nprocs=world_size,
         join=True
     )
