@@ -163,7 +163,7 @@ def train_enhanced_model(model, train_loader, val_loader, n_epochs,
         model.train()
         total_metrics = {
             'mse': 0, 'direction': 0, 'smoothness': 0,
-            'tmdo_reg': 0, 'group_consistency': 0
+            'mcao_reg': 0, 'group_consistency': 0
         }
         
         pbar = tqdm(train_loader, desc=f'Epoch {epoch+1}/{n_epochs}')
@@ -177,7 +177,7 @@ def train_enhanced_model(model, train_loader, val_loader, n_epochs,
             optimizer.zero_grad()
             
             # 前向传播
-            predictions, tmdo_features, group_features = model(
+            predictions, mcao_features, group_features = model(
                 sequence, events, time_distances
             )
             
@@ -186,7 +186,7 @@ def train_enhanced_model(model, train_loader, val_loader, n_epochs,
                 predictions,
                 target,
                 sequence[:, -1, 3],  # 假设收盘价是第4列
-                tmdo_features,
+                mcao_features,
                 group_features
             )
             
@@ -224,7 +224,7 @@ def train_enhanced_model(model, train_loader, val_loader, n_epochs,
                 time_distances = time_distances.to(device)
                 target = target.to(device)
                 
-                predictions, tmdo_features, group_features = model(
+                predictions, mcao_features, group_features = model(
                     sequence, events, time_distances
                 )
                 
@@ -232,7 +232,7 @@ def train_enhanced_model(model, train_loader, val_loader, n_epochs,
                     predictions,
                     target,
                     sequence[:, -1, 3],
-                    tmdo_features,
+                    mcao_features,
                     group_features
                 )
                 
