@@ -24,9 +24,9 @@ def rolling_normalize(series, window=21):
     normalized = (series - rolling_mean) / (rolling_std + eps)
     
     # Forward fill NaN values at the beginning
-    normalized = normalized.fillna(method='ffill')
+    normalized = normalized.ffill()
     # Backward fill any remaining NaN values
-    normalized = normalized.fillna(method='bfill')
+    normalized = normalized.bfill()
     
     return normalized
 
@@ -138,7 +138,7 @@ def download_and_prepare_data(symbol, start_date, end_date, window=21):
     window (int): Size of rolling window for normalization
     """
     # Download stock data
-    stock = yf.download(symbol, start=start_date, end=end_date)
+    stock = yf.download(symbol, start=start_date, end=end_date, progress=False)
 
     if isinstance(stock.columns, pd.MultiIndex):
         stock = stock.xs(symbol, level=1, axis=1) if symbol in stock.columns.levels[1] else stock
@@ -173,10 +173,10 @@ def download_and_prepare_data(symbol, start_date, end_date, window=21):
     stock['FFT_63'] = apply_fft_filter(stock, 63)
     
     # Forward fill any NaN values from indicators
-    stock = stock.fillna(method='ffill')
+    stock = stock.ffill()
     
     # Backward fill any remaining NaN values at the beginning
-    stock = stock.fillna(method='bfill')
+    stock = stock.bfill()
     
     # Apply rolling window normalization to all columns
     columns_to_normalize = [
@@ -198,72 +198,6 @@ def load_data_from_csv(file_path):
     data['Date'] = pd.to_datetime(data['Date'])
     data.set_index('Date', inplace=True)
     return data
-
-if __name__ == "__main__":
-    # Test code with error handling
-    symbols = [# 科技股
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "INTC", "CRM", 
-    "ADBE", "NFLX", "CSCO", "ORCL", "QCOM", "IBM", "AMAT", "MU", "NOW", "SNOW", "AVGO"
-    
-    # 金融股
-    "JPM", "BAC", "WFC", "GS", "MS", "C", "BLK", "AXP", "V", "MA",
-    "COF", "USB", "PNC", "SCHW", "BK", "TFC", "AIG", "MET", "PRU", "ALL", "ICE", "MCO"
-    
-    # 医疗保健
-    "JNJ", "UNH", "PFE", "ABBV", "MRK", "TMO", "ABT", "DHR", "BMY", "LLY",
-    "AMGN", "GILD", "ISRG", "CVS", "CI", "HUM", "BIIB", "VRTX", "REGN", "ZTS",
-    
-    # 消费品
-    "PG", "KO", "PEP", "WMT", "HD", "MCD", "NKE", "SBUX", "TGT", "LOW",
-    "COST", "DIS", "CMCSA", "VZ", "T", "CL", "EL", "KMB", "GIS", "K", "PDD", "GOTU",
-    
-    # 工业
-    "BA", "GE", "MMM", "CAT", "HON", "UPS", "LMT", "RTX", "DE", "EMR",
-    "FDX", "NSC", "UNP", "WM", "ETN", "PH", "ROK", "CMI", "IR", "GD",
-    
-    # 能源
-    "XOM", "CVX", "COP", "EOG", "SLB", "MPC", "PSX", "VLO", "OXY",
-    "KMI", "WMB", "EP", "HAL", "DVN", "HES", "MRO", "APA", "FANG", "BKR",
-    
-    # 材料
-    "LIN", "APD", "ECL", "SHW", "FCX", "NEM", "NUE", "VMC", "MLM", "DOW",
-    "DD", "PPG", "ALB", "EMN", "CE", "CF", "MOS", "IFF", "FMC", "SEE",
-    
-    # 房地产
-    "AMT", "PLD", "CCI", "EQIX", "PSA", "DLR", "O", "WELL", "AVB", "EQR",
-    "SPG", "VTR", "BXP", "ARE", "MAA", "UDR", "HST", "KIM", "REG", "ESS",
-    
-    # 中概股
-    "BABA", "JD", "PDD", "BIDU", "NIO", "XPEV", "LI", "TME", "BILI", "IQ",
-    
-    # ETF
-    "SPY", "QQQ", "DIA", "IWM", "VOO", "IVV", "ARKK", "XLF", "XLK", "XLE", 
-    "VNQ", "TLT", "HYG", "EEM", "GDX", "VTI", "IEMG", "XLY", "XLP", "USO",
-
-    # 指数
-    "^GSPC", "^NDX", "^DJI", "^RUT", "^VIX", 
-    "^IXIC", "^HSI", "000001.SS", "^GDAXI", "^FTSE",
-    ]
-    # symbols = [
-    #     "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "INTC", "CRM", 
-    #     "^GSPC", "^NDX", "^DJI", "^IXIC",
-    #     "UNH", "ABBV","LLY",
-    #     "FANG", "DLR", "PSA", "BABA", "JD", "BIDU",
-    #     "QQQ"
-    # ]
-    symbols = ["AAPL"]
-    try:
-        for ticker in tqdm(symbols):
-            data = download_and_prepare_data(ticker, '1980-01-01', '2024-01-01')
-            print("\nFirst few rows:")
-            print(data.head())
-            print("\nData shape:", data.shape)
-            print("\nColumns:", data.columns.tolist())
-            data.to_csv(f'data\{ticker}.csv', index=True)
-        
-    except Exception as e:
-        print(f"Error occurred: {str(e)}")
-
 
 def combine_stock_data(symbols, start_date, end_date):
     """
