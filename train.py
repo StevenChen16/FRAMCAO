@@ -1,15 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from torch.optim import Adam
 import numpy as np
-from data import download_and_prepare_data
-from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-from model import prepare_feature_groups, EnhancedStockPredictor
-import pandas as pd
-import pickle
 
 class EnhancedStockDataset(Dataset):
     def __init__(self, data, events, seq_length=10, prediction_horizon=1):
@@ -128,7 +123,7 @@ class EnhancedCombinedLoss(nn.Module):
             smoothness_loss *= 1.5
             
         # 特征正则化
-        feature_reg = torch.mean(torch.abs(features))
+        mcao_features = torch.mean(torch.abs(features))
         
         # 特征组一致性损失
         group_consistency_loss = self._compute_group_consistency(group_features)
@@ -137,14 +132,14 @@ class EnhancedCombinedLoss(nn.Module):
         total_loss = (self.alpha * mse_loss +
                      self.beta * direction_loss +
                      self.gamma * smoothness_loss +
-                     self.delta * feature_reg +
+                     self.delta * mcao_features +
                      self.epsilon * group_consistency_loss)
         
         return total_loss, {
             'mse': mse_loss.item(),
             'direction': direction_loss.item(),
             'smoothness': smoothness_loss.item(),
-            'feature_reg': feature_reg.item(),
+            'mcao_features': mcao_features.item(),
             'group_consistency': group_consistency_loss.item()
         }
 
@@ -386,136 +381,3 @@ def add_real_events(events, news_data=None, filings_data=None):
                 # ... 处理其他类型的公告
     
     return events
-
-def combine_stock_data(symbols, start_date, end_date):
-    """
-    下载多只股票的数据并拼接
-    
-    Args:
-        symbols (list): 股票代码列表
-        start_date (str): 开始日期
-        end_date (str): 结束日期
-    
-    Returns:
-        pd.DataFrame: 拼接后的数据
-    """
-    all_data = []
-    
-    for symbol in tqdm(symbols):
-        # 获取单个股票数据
-        data = download_and_prepare_data(symbol, start_date, end_date)
-
-        if not data.empty:
-            # 将数据添加到列表中
-            all_data.append(data)
-    
-    # 直接拼接所有数据
-    combined_data = pd.concat(all_data, axis=0, ignore_index=True)
-    
-    return combined_data
-
-# 主程序
-def main():
-    # 设置设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # 准备数据
-    # 这里需要实现数据下载和预处理的代码
-    # data = download_and_prepare_data('AAPL', '1980-01-01', '2024-01-01')
-    symbols = [# 科技股
-    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "INTC", "CRM", 
-    "ADBE", "NFLX", "CSCO", "ORCL", "QCOM", "IBM", "AMAT", "MU", "NOW", "SNOW",
-    
-    # 金融股
-    "JPM", "BAC", "WFC", "GS", "MS", "C", "BLK", "AXP", "V", "MA",
-    "COF", "USB", "PNC", "SCHW", "BK", "TFC", "AIG", "MET", "PRU", "ALL",
-    
-    # 医疗保健
-    "JNJ", "UNH", "PFE", "ABBV", "MRK", "TMO", "ABT", "DHR", "BMY", "LLY",
-    "AMGN", "GILD", "ISRG", "CVS", "CI", "HUM", "BIIB", "VRTX", "REGN", "ZTS",
-    
-    # 消费品
-    "PG", "KO", "PEP", "WMT", "HD", "MCD", "NKE", "SBUX", "TGT", "LOW",
-    "COST", "DIS", "CMCSA", "VZ", "T", "CL", "EL", "KMB", "GIS", "K", "PDD", "GOTU",
-    
-    # 工业
-    "BA", "GE", "MMM", "CAT", "HON", "UPS", "LMT", "RTX", "DE", "EMR",
-    "FDX", "NSC", "UNP", "WM", "ETN", "PH", "ROK", "CMI", "IR", "GD",
-    
-    # 能源
-    "XOM", "CVX", "COP", "EOG", "SLB", "MPC", "PSX", "VLO", "OXY",
-    "KMI", "WMB", "EP", "HAL", "DVN", "HES", "MRO", "APA", "FANG", "BKR",
-    
-    # 材料
-    "LIN", "APD", "ECL", "SHW", "FCX", "NEM", "NUE", "VMC", "MLM", "DOW",
-    "DD", "PPG", "ALB", "EMN", "CE", "CF", "MOS", "IFF", "FMC", "SEE",
-    
-    # 房地产
-    "AMT", "PLD", "CCI", "EQIX", "PSA", "DLR", "O", "WELL", "AVB", "EQR",
-    "SPG", "VTR", "BXP", "ARE", "MAA", "UDR", "HST", "KIM", "REG", "ESS",
-    
-    # 中概股
-    "BABA", "JD", "PDD", "BIDU", "NIO", "XPEV", "LI", "TME", "BILI", "IQ",
-    
-    # ETF
-    "SPY", "QQQ", "DIA", "IWM", "VOO", "IVV", "ARKK", "XLF", "XLK", "XLE", 
-    "VNQ", "TLT", "HYG", "EEM", "GDX", "VTI", "IEMG", "XLY", "XLP", "USO",
-
-    # 指数
-    "^GSPC", "^NDX", "^DJI", "^RUT", "^VIX", 
-    "^IXIC", "^HSI", "000001.SS", "^GDAXI", "^FTSE",
-    ]
-    symbols = ['AAPL', 'MSFT']
-    data = combine_stock_data(symbols, '1980-01-01', '2024-01-01')
-    events = generate_event_data(data)  # 需要实现这个函数
-    
-    # 划分训练集和验证集
-    train_data, val_data = train_test_split(data, test_size=0.2, shuffle=False)
-    train_events, val_events = train_test_split(events, test_size=0.2, shuffle=False)
-    
-    # 创建数据集
-    train_dataset = EnhancedStockDataset(train_data, train_events)
-    val_dataset = EnhancedStockDataset(val_data, val_events)
-
-    # Using pickle to save the train_dataset and val_dataset.
-    with open('train_dataset_1.pkl', 'wb') as f:
-        pickle.dump(train_dataset, f)
-    
-    # 创建数据加载器
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=32768,
-        shuffle=True,
-        num_workers=4
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=32768,
-        shuffle=False,
-        num_workers=4
-    )
-    
-    # 初始化模型
-    feature_groups = prepare_feature_groups()
-    model = EnhancedStockPredictor(
-        input_dim=21,
-        hidden_dim=128,
-        event_dim=32,
-        num_event_types=10,
-        feature_groups=feature_groups
-    ).to(device)
-    
-    # 训练模型
-    trained_model = train_enhanced_model(
-        model,
-        train_loader,
-        val_loader,
-        n_epochs=50,
-        device=device
-    )
-    
-    # 保存模型
-    torch.save(trained_model.state_dict(), 'enhanced_stock_predictor.pth')
-
-if __name__ == "__main__":
-    main()

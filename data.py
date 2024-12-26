@@ -263,3 +263,31 @@ if __name__ == "__main__":
         
     except Exception as e:
         print(f"Error occurred: {str(e)}")
+
+
+def combine_stock_data(symbols, start_date, end_date):
+    """
+    下载多只股票的数据并拼接
+    
+    Args:
+        symbols (list): 股票代码列表
+        start_date (str): 开始日期
+        end_date (str): 结束日期
+    
+    Returns:
+        pd.DataFrame: 拼接后的数据
+    """
+    all_data = []
+    
+    for symbol in tqdm(symbols):
+        # 获取单个股票数据
+        data = download_and_prepare_data(symbol, start_date, end_date)
+
+        if not data.empty:
+            # 将数据添加到列表中
+            all_data.append(data)
+    
+    # 直接拼接所有数据
+    combined_data = pd.concat(all_data, axis=0, ignore_index=True)
+    
+    return combined_data

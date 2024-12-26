@@ -4,47 +4,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
-import sys
 import os
 import numpy as np
 import pandas as pd
-import pickle
-from CNN import ResidualFinancialBlock, EnhancedStockDataset
-from train import EnhancedCombinedLoss, train_enhanced_model, generate_event_data#, combine_stock_data
-from data import load_data_from_csv, download_and_prepare_data
+from train import EnhancedCombinedLoss, generate_event_data
+from data import load_data_from_csv, download_and_prepare_data, combine_stock_data
 from sklearn.model_selection import train_test_split
 from model import EnhancedMCAOLSTMCell, EventProcessor, MCAO, prepare_feature_groups, MCAOEnhancedLSTM
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
-
-def combine_stock_data(symbols, start_date, end_date):
-    """
-    下载多只股票的数据并拼接
-    
-    Args:
-        symbols (list): 股票代码列表
-        start_date (str): 开始日期/
-        
-        end_date (str): 结束日期
-    
-    Returns:
-        pd.DataFrame: 拼接后的数据
-    """
-    all_data = []
-    
-    for symbol in tqdm(symbols):
-        # 获取单个股票数据
-        # data = download_and_prepare_data(symbol, start_date, end_date)
-        data = load_data_from_csv(f"./data/{symbol}.csv")
-
-        if not data.empty:
-            # 将数据添加到列表中
-            all_data.append(data)
-    
-    # 直接拼接所有数据
-    combined_data = pd.concat(all_data, axis=0, ignore_index=True)
-    
-    return combined_data
+from CNN import ResidualCNNBranch
 
 class CNNBranch(nn.Module):
     """分离的CNN分支"""
@@ -557,7 +526,7 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
         for k, v in cnn_weights.items() 
         if k.startswith('cnn_branch')
     }
-    model.cnn_branch.load_state_dict(cnn_weights_filtered)
+    model.cnn_branch.load_state_dict(dict(cnn_weights))
     
     # 加载MCAO-LSTM权重 
     lstm_weights = torch.load(lstm_state_dict)['model_state_dict']
@@ -644,7 +613,7 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
             'mse': 0,
             'direction': 0, 
             'smoothness': 0,
-            'feature_reg': 0,
+            'mcao_features': 0,
             'group_consistency': 0
         }
         
@@ -693,7 +662,7 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
     
     patience_counter = 0
     best_val_loss = float('inf')
-    remaining_epochs = n_epochs - epoch - 1
+    remaining_epochs = n_epochs - epoch
     
     for epoch in range(remaining_epochs):
         model.train()
@@ -791,7 +760,7 @@ def validate_model(model, val_loader, criterion, writer, epoch, device):
     model.eval()
     val_loss = 0
     val_metrics = {'mse': 0, 'direction': 0, 'smoothness': 0,
-                  'mcao_reg': 0, 'group_consistency': 0}
+                  'mcao_features': 0, 'group_consistency': 0}
     
     with torch.no_grad():
         for batch in val_loader:
@@ -962,26 +931,8 @@ class FRAMCAOCNNFusion(nn.Module):
         # 修改：先做通道调整，将input_dim通道转换为1通道
         self.channel_adjust = nn.Conv2d(input_dim, 1, kernel_size=1)
         
-        # CNN分支 - 保持与预训练模型相同的结构
-        self.cnn_branch = nn.Sequential(
-            nn.Conv2d(1, hidden_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden_dim),
-            nn.GELU(),
-            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(hidden_dim),
-            nn.GELU()
-        )
-
-        
-        # 初始化权重
-        for m in self.cnn_branch.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(
-                    m.weight, mode='fan_out', nonlinearity='relu'
-                )
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+        # CNN分支使用与预训练相同的结构
+        self.cnn_branch = ResidualCNNBranch(input_dim, hidden_dim)
         
         # 其他组件
         self.framcao = EnhancedMCAOLSTMCell(input_dim, hidden_dim)
@@ -1023,35 +974,42 @@ class FRAMCAOCNNFusion(nn.Module):
             nn.Linear(hidden_dim // 2, 1)
         )
 
-        # 初始化所有Linear层
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
-
     def _apply_cnn(self, x):
-        """CNN特征提取"""
+        """CNN feature extraction with sequence length adjustment"""
         batch_size, seq_len, features = x.shape
         
-        # [batch, seq, features] -> [batch, features, seq, 1]
-        x = x.permute(0, 2, 1).unsqueeze(-1)
+        # [batch, seq, features] -> [batch, features, seq]
+        x = x.transpose(1, 2)
         
-        # 新增：通道调整
-        x = self.channel_adjust(x)
+        # Apply CNN branch
+        pred, features = self.cnn_branch(x)
         
-        # CNN特征提取
-        cnn_features = self.cnn_branch(x)
+        # Adjust sequence length using interpolation
+        # [batch, seq=21, hidden=128] -> [batch, seq=250, hidden=128]
+        features = F.interpolate(
+            features.transpose(1, 2),  # [batch, hidden=128, seq=21]
+            size=seq_len,
+            mode='linear',
+            align_corners=False
+        ).transpose(1, 2)  # [batch, seq=250, hidden=128]
+        assert features.size(1) == seq_len, f"Feature sequence length mismatch: got {features.size(1)}, expected {seq_len}"
         
-        # [batch, hidden, seq, 1] -> [batch, seq, hidden]
-        return cnn_features.squeeze(-1).permute(0, 2, 1)
-
+        # Also adjust predictions if needed
+        if pred.size(1) != seq_len:
+            pred = F.interpolate(
+                pred.transpose(1, 2),  # [batch, 1, seq]
+                size=seq_len,
+                mode='linear',
+                align_corners=False
+            ).transpose(1, 2)  # [batch, seq, 1]
+        
+        return pred, features
     
     def forward(self, x, events, time_distances):
         batch_size, seq_len = x.size(0), x.size(1)
         
         # CNN特征提取
-        cnn_features = self._apply_cnn(x)
+        cnn_predictions, cnn_features = self._apply_cnn(x)
         if torch.isnan(cnn_features).any():
             print("NaN detected in CNN features")
             return None, None, None
@@ -1101,35 +1059,36 @@ class FRAMCAOCNNFusion(nn.Module):
             
             # 交叉注意力处理
             h_query = h.unsqueeze(1)
-            cnn_kv = current_cnn.unsqueeze(1)
+            current_cnn = current_cnn.unsqueeze(1)
             
             h_enhanced, _ = self.cross_attention(
                 h_query,
-                cnn_kv,
-                cnn_kv
+                current_cnn,
+                current_cnn
             )
             h_enhanced = h_enhanced.squeeze(1)
+            
             if torch.isnan(h_enhanced).any():
                 print(f"NaN detected in attention output at step {t}")
                 return None, None, None
                 
             # 特征融合
             fusion_weight = self.fusion_gate(
-                torch.cat([h_enhanced, current_cnn], dim=-1)
+                torch.cat([h_enhanced, current_cnn.squeeze(1)], dim=-1)
             )
             if torch.isnan(fusion_weight).any():
                 print(f"NaN detected in fusion_weight at step {t}")
                 return None, None, None
                 
             market_impact = self.market_state(
-                torch.cat([h_enhanced, current_cnn], dim=-1)
+                torch.cat([h_enhanced, current_cnn.squeeze(1)], dim=-1)
             )
             if torch.isnan(market_impact).any():
                 print(f"NaN detected in market_impact at step {t}")
                 return None, None, None
                 
             # 最终特征组合
-            combined = fusion_weight * h_enhanced + (1 - fusion_weight) * current_cnn
+            combined = fusion_weight * h_enhanced + (1 - fusion_weight) * current_cnn.squeeze(1)
             combined = combined * market_impact
             
             if torch.isnan(combined).any():
@@ -1357,115 +1316,6 @@ def train_fusion_model(model, train_loader, val_loader,
     writer.close()
     return model
 
-# 在fusion_model.py中修改main函数
-
-def main():
-    # 参数设置
-    input_dim = 21  # 输入特征维度
-    hidden_dim = 128  # 隐藏层维度
-    event_dim = 32  # 事件嵌入维度
-    num_event_types = 10  # 事件类型数量
-    
-    # 数据准备
-    symbols = [
-        "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "INTC", "CRM", 
-        "^GSPC", "^NDX", "^DJI", "^IXIC",
-        "UNH", "ABBV", "LLY",
-        "FANG", "DLR", "PSA", "BABA", "JD", "BIDU",
-        "QQQ"
-    ]
-    data = combine_stock_data(symbols, '2020-01-01', '2024-01-01')
-    events = generate_event_data(data)
-    
-    # 划分训练集和验证集
-    train_data, val_data = train_test_split(data, test_size=0.2, shuffle=False)
-    train_events, val_events = train_test_split(events, test_size=0.2, shuffle=False)
-    
-    # 创建数据集
-    train_dataset = FusionStockDataset(train_data, train_events)
-    val_dataset = FusionStockDataset(val_data, val_events)
-    
-    # 创建数据加载器
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=3200,
-        shuffle=True,
-        num_workers=4
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=3200,
-        shuffle=False,
-        num_workers=4
-    )
-
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print("Using device:", device)
-    
-    # Step 1: 训练CNN分支
-    print("\nStep 1: Training CNN Branch...")
-    cnn_model = CNNBranch(
-        input_dim=input_dim,
-        hidden_dim=hidden_dim
-    ).to(device)
-    
-    cnn_model = train_cnn_branch(
-        model=cnn_model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        n_epochs=30,
-        device=device,
-        learning_rate=0.0001,
-        checkpoint_dir='checkpoints/cnn'
-    )
-    
-    # Step 2: 训练LSTM分支
-    print("\nStep 2: Training LSTM Branch...")
-    model = MCAOEnhancedLSTM(
-        input_size=21,    # 输入特征维度
-        hidden_size=128   # 隐藏层维度
-    ).to(device)
-
-    # 训练模型
-    trained_model = train_mcao_lstm(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        n_epochs=30,
-        device=device,
-        learning_rate=0.0001,
-        checkpoint_dir='checkpoints/mcao_lstm'
-    )
-    
-    # Step 3: 融合训练
-    print("\nStep 3: Progressive Fusion Training...")
-    fusion_model = FRAMCAOCNNFusion(
-        input_dim=input_dim,
-        hidden_dim=hidden_dim,
-        event_dim=event_dim,
-        num_event_types=num_event_types,
-        feature_groups=prepare_feature_groups()
-    ).to(device)
-    
-    # 使用预训练的分支模型进行融合训练
-    trained_model = train_fusion_model_progressive(
-        model=fusion_model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        cnn_state_dict='checkpoints/cnn/best_model.pt',
-        lstm_state_dict='checkpoints/mcao_lstm/best_model.pt',
-        n_epochs=50,
-        device=device,
-        learning_rate=0.0001,
-        checkpoint_dir='checkpoints/fusion'
-    )
-    
-    # 保存最终模型
-    torch.save(
-        trained_model.state_dict(),
-        'checkpoints/final_model.pt'
-    )# 在fusion_model.py中修改main函数
-
 def main():
     # 参数设置
     input_dim = 21  # 输入特征维度
@@ -1518,11 +1368,11 @@ def main():
     "^IXIC", "^HSI", "000001.SS", "^GDAXI", "^FTSE",
     ]
     symbols = [
-        "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "INTC", "CRM", 
-        "^GSPC", "^NDX", "^DJI", "^IXIC",
-        "UNH", "ABBV", "LLY",
-        "FANG", "DLR", "PSA", "BABA", "JD", "BIDU",
-        "QQQ"
+        "AAPL", "MSFT", "GOOGL", #"AMZN", "META", "NVDA", "TSLA", "AMD", "INTC", "CRM", 
+        # "^GSPC", "^NDX", "^DJI", "^IXIC",
+        # "UNH", "ABBV", "LLY",
+        # "FANG", "DLR", "PSA", "BABA", "JD", "BIDU",
+        # "QQQ"
     ]
     data = combine_stock_data(symbols, '2020-01-01', '2024-01-01')
     events = generate_event_data(data)
@@ -1538,13 +1388,13 @@ def main():
     # 创建数据加载器
     train_loader = DataLoader(
         train_dataset,
-        batch_size=512,
+        batch_size=8,
         shuffle=True,
         num_workers=4
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=512,
+        batch_size=8,
         shuffle=False,
         num_workers=4
     )
@@ -1552,13 +1402,13 @@ def main():
     #CNN分支数据加载器
     train_loader_CNN = DataLoader(
         train_dataset,
-        batch_size=32,
+        batch_size=2,
         shuffle=True,
         num_workers=4
     )
     val_loader_CNN = DataLoader(
         val_dataset,
-        batch_size=32,
+        batch_size=2,
         shuffle=False,
         num_workers=4
     )
@@ -1566,13 +1416,13 @@ def main():
     #LSTM分支数据加载器
     train_loader_lstm = DataLoader(
         train_dataset,
-        batch_size=4096,
+        batch_size=8192,
         shuffle=True,
         num_workers=4
     )
     val_loader_lstm = DataLoader(
         val_dataset,
-        batch_size=4096,
+        batch_size=8192,
         shuffle=False,
         num_workers=4
     )
@@ -1582,7 +1432,7 @@ def main():
     
     # Step 1: 训练CNN分支
     print("\nStep 1: Training CNN Branch...")
-    cnn_model = CNNBranch(
+    cnn_model = ResidualCNNBranch(
         input_dim=input_dim,
         hidden_dim=hidden_dim
     ).to(device)
@@ -1614,7 +1464,6 @@ def main():
         learning_rate=0.0001,
         checkpoint_dir='checkpoints/mcao_lstm'
     )
-
     
     # Step 3: 融合训练
     print("\nStep 3: Progressive Fusion Training...")
@@ -1633,7 +1482,7 @@ def main():
         val_loader=val_loader,
         cnn_state_dict='checkpoints/cnn/best_model.pt',
         lstm_state_dict='checkpoints/mcao_lstm/best_model.pt',
-        n_epochs=50,
+        n_epochs=2,
         device=device,
         learning_rate=0.0001,
         checkpoint_dir='checkpoints/fusion'
