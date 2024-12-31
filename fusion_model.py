@@ -499,7 +499,8 @@ def train_mcao_lstm(model, train_loader, val_loader,
 def train_fusion_model_progressive(model, train_loader, val_loader,
                                  cnn_state_dict, lstm_state_dict,
                                  n_epochs=50, device='cuda', learning_rate=0.0001,
-                                 checkpoint_dir='checkpoints/fusion'):
+                                 checkpoint_dir='checkpoints/fusion', 
+                                 train_stage_1=True, train_stage_2=True):
     """MCAO增强版fusion model的渐进式训练
     
     Args:
@@ -512,6 +513,8 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
         device: 训练设备
         learning_rate: 学习率
         checkpoint_dir: 模型保存路径
+        train_stage_1: 是否训练第一阶段
+        train_stage_2: 是否训练第二阶段
     """
     os.makedirs(checkpoint_dir, exist_ok=True)
     writer = SummaryWriter('runs/fusion_model')
@@ -520,7 +523,7 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
     print("Loading pretrained weights...")
     
     # 加载CNN分支权重
-    cnn_weights = torch.load(cnn_state_dict)['model_state_dict']
+    cnn_weights = torch.load(cnn_state_dict, map_location='cuda:0')['model_state_dict']
     cnn_weights_filtered = {
         k.replace('cnn_branch.', ''): v 
         for k, v in cnn_weights.items() 
@@ -529,7 +532,7 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
     model.cnn_branch.load_state_dict(dict(cnn_weights))
     
     # 加载MCAO-LSTM权重 
-    lstm_weights = torch.load(lstm_state_dict)['model_state_dict']
+    lstm_weights = torch.load(lstm_state_dict, map_location='cuda:0')['model_state_dict']
     
     # 初始化EnhancedMCAOLSTMCell的权重
     mcao_lstm_state = {}
@@ -604,103 +607,112 @@ def train_fusion_model_progressive(model, train_loader, val_loader,
     patience_counter = 0
     best_model_state = None
     
-    print("Stage 1: Training fusion layers only...")
-    
-    # 训练融合层
-    for epoch in range(n_epochs // 2):
-        model.train()
-        total_metrics = {
-            'mse': 0,
-            'direction': 0, 
-            'smoothness': 0,
-            'mcao_features': 0,
-            'group_consistency': 0
-        }
+    if train_stage_1:
+        print("Stage 1: Training fusion layers only...")
         
-        pbar = tqdm(train_loader, desc=f'Fusion Stage 1 - Epoch {epoch+1}/{n_epochs//2}')
-        train_one_epoch(model, pbar, optimizer, scheduler, criterion, writer, 
-                       total_metrics, epoch, device)
+        # 训练融合层
+        for epoch in range(n_epochs // 2):
+            model.train()
+            total_metrics = {
+                'mse': 0,
+                'direction': 0, 
+                'smoothness': 0,
+                'mcao_features': 0,
+                'group_consistency': 0
+            }
+            
+            pbar = tqdm(train_loader, desc=f'Fusion Stage 1 - Epoch {epoch+1}/{n_epochs//2}')
+            train_one_epoch(model, pbar, optimizer, scheduler, criterion, writer, 
+                        total_metrics, epoch, device)
+            
+            print("\nValidation...")
+            
+            # 验证
+            val_loss = validate_model(model, val_loader, criterion, writer, epoch, device)
+            
+            # 早停检查
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_state = model.state_dict()
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_loss': val_loss,
+                }, os.path.join(checkpoint_dir, 'stage1_best_model.pt'))
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print("Early stopping triggered for Stage 1")
+                    break
+    
+    if train_stage_2:
+
+        if not train_stage_1:
+            # 加载最佳模型
+            checkpoint = torch.load(os.path.join(checkpoint_dir, 'stage1_best_model.pt'))
+
+        # 第二阶段：解冻所有层进行微调
+        epoch = n_epochs // 2
+        print("\nStage 2: Fine-tuning all layers...")
         
-        # 验证
-        val_loss = validate_model(model, val_loader, criterion, writer, epoch, device)
+        # 解冻所有层
+        for param in model.parameters():
+            param.requires_grad = True
         
-        # 早停检查
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model_state = model.state_dict()
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_loss,
-            }, os.path.join(checkpoint_dir, 'stage1_best_model.pt'))
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print("Early stopping triggered for Stage 1")
-                break
-    
-    # 第二阶段：解冻所有层进行微调
-    epoch = n_epochs // 2
-    print("\nStage 2: Fine-tuning all layers...")
-    
-    # 解冻所有层
-    for param in model.parameters():
-        param.requires_grad = True
-    
-    # 使用较小的学习率
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=learning_rate * 0.1,
-        weight_decay=0.01
-    )
-    
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer, T_0=5, T_mult=2, eta_min=1e-7
-    )
-    
-    patience_counter = 0
-    best_val_loss = float('inf')
-    remaining_epochs = n_epochs - epoch
-    
-    for epoch in range(remaining_epochs):
-        model.train()
-        total_metrics = {
-            'mse': 0, 'direction': 0, 'smoothness': 0,
-            'mcao_reg': 0, 'group_consistency': 0
-        }
+        # 使用较小的学习率
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=learning_rate * 0.1,
+            weight_decay=0.01
+        )
         
-        pbar = tqdm(train_loader, desc=f'Fusion Stage 2 - Epoch {epoch+1}/{remaining_epochs}')
-        train_one_epoch(model, pbar, optimizer, scheduler, criterion, writer, 
-                       total_metrics, epoch + n_epochs//2, device)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=5, T_mult=2, eta_min=1e-7
+        )
         
-        # 验证
-        val_loss = validate_model(model, val_loader, criterion, writer, 
-                                epoch + n_epochs//2, device)
+        patience_counter = 0
+        best_val_loss = float('inf')
+        remaining_epochs = n_epochs - epoch
         
-        # 早停检查
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model_state = model.state_dict()
-            torch.save({
-                'epoch': epoch + n_epochs//2,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_loss,
-            }, os.path.join(checkpoint_dir, 'stage2_best_model.pt'))
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print("Early stopping triggered for Stage 2")
-                break
-    
-    if best_model_state is not None:
-        model.load_state_dict(best_model_state)
-    
-    writer.close()
-    return model
+        for epoch in range(remaining_epochs):
+            model.train()
+            total_metrics = {
+                'mse': 0, 'direction': 0, 'smoothness': 0,
+                'mcao_reg': 0, 'group_consistency': 0
+            }
+            
+            pbar = tqdm(train_loader, desc=f'Fusion Stage 2 - Epoch {epoch+1}/{remaining_epochs}')
+            train_one_epoch(model, pbar, optimizer, scheduler, criterion, writer, 
+                        total_metrics, epoch + n_epochs//2, device)
+            
+            # 验证
+            val_loss = validate_model(model, val_loader, criterion, writer, 
+                                    epoch + n_epochs//2, device)
+            
+            # 早停检查
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_model_state = model.state_dict()
+                torch.save({
+                    'epoch': epoch + n_epochs//2,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'val_loss': val_loss,
+                }, os.path.join(checkpoint_dir, 'stage2_best_model.pt'))
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print("Early stopping triggered for Stage 2")
+                    break
+        
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
+        
+        writer.close()
+        return model
 
 def train_one_epoch(model, pbar, optimizer, scheduler, criterion, writer,
                    total_metrics, epoch, device):
@@ -763,7 +775,7 @@ def validate_model(model, val_loader, criterion, writer, epoch, device):
                   'mcao_features': 0, 'group_consistency': 0}
     
     with torch.no_grad():
-        for batch in val_loader:
+        for batch in tqdm(val_loader, desc='Validating'):
             sequence = batch['sequence'].to(device)
             events = batch['events'].to(device)
             time_distances = batch['time_distances'].to(device)
@@ -799,8 +811,6 @@ def validate_model(model, val_loader, criterion, writer, epoch, device):
             writer.add_scalar(f'Validation/{k}', v_avg, epoch)
     
     return val_loss
-
-
 
 class FusionStockDataset(Dataset):
     """
@@ -1324,7 +1334,7 @@ def main():
     num_event_types = 10  # 事件类型数量
     
     # 数据准备
-    symbols_200 = [# 科技股
+    symbols = [# 科技股
     "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "INTC", "CRM", 
     "ADBE", "NFLX", "CSCO", "ORCL", "QCOM", "IBM", "AMAT", "MU", "NOW", "SNOW",
     
@@ -1368,7 +1378,7 @@ def main():
     "^IXIC", "^HSI", "000001.SS", "^GDAXI", "^FTSE",
     ]
     symbols = [
-        "AAPL", "MSFT", "GOOGL", #"AMZN", "META", "NVDA", "TSLA", "AMD", "INTC", "CRM", 
+        # "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "INTC", "CRM", 
         # "^GSPC", "^NDX", "^DJI", "^IXIC",
         # "UNH", "ABBV", "LLY",
         # "FANG", "DLR", "PSA", "BABA", "JD", "BIDU",
@@ -1388,13 +1398,13 @@ def main():
     # 创建数据加载器
     train_loader = DataLoader(
         train_dataset,
-        batch_size=8,
+        batch_size=1,
         shuffle=True,
         num_workers=4
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=8,
+        batch_size=1,
         shuffle=False,
         num_workers=4
     )
@@ -1402,13 +1412,13 @@ def main():
     #CNN分支数据加载器
     train_loader_CNN = DataLoader(
         train_dataset,
-        batch_size=2,
+        batch_size=1,
         shuffle=True,
         num_workers=4
     )
     val_loader_CNN = DataLoader(
         val_dataset,
-        batch_size=2,
+        batch_size=1,
         shuffle=False,
         num_workers=4
     )
@@ -1416,13 +1426,13 @@ def main():
     #LSTM分支数据加载器
     train_loader_lstm = DataLoader(
         train_dataset,
-        batch_size=8192,
+        batch_size=11000,
         shuffle=True,
         num_workers=4
     )
     val_loader_lstm = DataLoader(
         val_dataset,
-        batch_size=8192,
+        batch_size=11000,
         shuffle=False,
         num_workers=4
     )
@@ -1485,7 +1495,9 @@ def main():
         n_epochs=2,
         device=device,
         learning_rate=0.0001,
-        checkpoint_dir='checkpoints/fusion'
+        checkpoint_dir='checkpoints/fusion',
+        train_stage_1=False,
+        train_stage_2=True,
     )
     
     # 保存最终模型
