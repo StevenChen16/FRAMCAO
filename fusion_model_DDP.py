@@ -20,12 +20,11 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.multiprocessing as mp
 import argparse
 
-
-# 在第38行左右添加
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
 def cleanup():
     dist.destroy_process_group()
@@ -1483,7 +1482,7 @@ def main(rank, world_size, args):
     val_dataset = FusionStockDataset(val_data, val_events)
     
     # 创建数据加载器
-    train_sampler = DistributedSampler(train_dataset)
+    train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.fusion_batch_size,
@@ -1497,10 +1496,10 @@ def main(rank, world_size, args):
         batch_size=8,
         shuffle=False,
         num_workers=4
-    )
+    ) if rank == 0 else None
 
     #CNN分支数据加载器
-    train_sampler_cnn = DistributedSampler(train_dataset)
+    train_sampler_cnn = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
     train_loader_CNN = DataLoader(
         train_dataset,
         batch_size=args.cnn_batch_size,
@@ -1514,10 +1513,10 @@ def main(rank, world_size, args):
         batch_size=2,
         shuffle=False,
         num_workers=4
-    )
+    ) if rank == 0 else None
 
     #LSTM分支数据加载器
-    train_sampler_lstm = DistributedSampler(train_dataset)
+    train_sampler_lstm = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank)
     train_loader_lstm = DataLoader(
         train_dataset,
         batch_size=args.lstm_batch_size,
@@ -1531,13 +1530,15 @@ def main(rank, world_size, args):
         batch_size=8192,
         shuffle=False,
         num_workers=4
-    )
+    ) if rank == 0 else None
 
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print("Using device:", device)
+    if rank == 0:
+        print("Using device:", device)
     
     # Step 1: 训练CNN分支
-    print("\nStep 1: Training CNN Branch...")
+    if rank == 0:
+        print("\nStep 1: Training CNN Branch...")
+    
     cnn_model = ResidualCNNBranch(
         input_dim=input_dim,
         hidden_dim=hidden_dim
@@ -1545,39 +1546,46 @@ def main(rank, world_size, args):
 
     cnn_model = DDP(cnn_model, device_ids=[rank])
     
-    cnn_model = train_cnn_branch(
-        model=cnn_model,
-        train_loader=train_loader_CNN,
-        val_loader=val_loader_CNN,
-        n_epochs=args.cnn_epochs,
-        device=device,
-        learning_rate=args.cnn_lr,
-        checkpoint_dir='checkpoints/cnn'
-    )
+    for epoch in range(args.cnn_epochs):
+        train_sampler_cnn.set_epoch(epoch)
+        cnn_model = train_cnn_branch(
+            model=cnn_model,
+            train_loader=train_loader_CNN,
+            val_loader=val_loader_CNN,
+            n_epochs=1,
+            device=device,
+            learning_rate=args.cnn_lr,
+            checkpoint_dir='checkpoints/cnn' if rank == 0 else None
+        )
     
     # Step 2: 训练LSTM分支
-    print("\nStep 2: Training LSTM Branch...")
-    model = MCAOEnhancedLSTM(
-    input_size=21,    # 输入特征维度
-    hidden_size=128   # 隐藏层维度
+    if rank == 0:
+        print("\nStep 2: Training LSTM Branch...")
+        
+    lstm_model = MCAOEnhancedLSTM(
+        input_size=21,    # 输入特征维度
+        hidden_size=128   # 隐藏层维度
     ).to(device)
 
-    model = DDP(model, device_ids=[rank])
+    lstm_model = DDP(lstm_model, device_ids=[rank])
 
-    # 训练模型
-    trained_model = train_mcao_lstm(
-        model=model,
-        train_loader=train_loader_lstm,
-        val_loader=val_loader_lstm,
-        n_epochs=args.lstm_epochs,
-        device=device,
-        learning_rate=args.lstm_lr,
-        checkpoint_dir='checkpoints/mcao_lstm'
-    )
+    for epoch in range(args.lstm_epochs):
+        train_sampler_lstm.set_epoch(epoch)
+        lstm_model = train_mcao_lstm(
+            model=lstm_model,
+            train_loader=train_loader_lstm,
+            val_loader=val_loader_lstm,
+            n_epochs=1,
+            device=device,
+            learning_rate=args.lstm_lr,
+            checkpoint_dir='checkpoints/mcao_lstm' if rank == 0 else None
+        )
     
     # Step 3: 融合训练
-    print("\nStep 3: Progressive Fusion Training...")
-    fusion_model = FRAMCAOCNNFusion(  # 这里使用FRAMCAOCNNFusion是正确的
+    if rank == 0:
+        print("\nStep 3: Progressive Fusion Training...")
+        
+    fusion_model = FRAMCAOCNNFusion(
         input_dim=input_dim,
         hidden_dim=hidden_dim,
         event_dim=event_dim,
@@ -1587,24 +1595,28 @@ def main(rank, world_size, args):
     
     fusion_model = DDP(fusion_model, device_ids=[rank])
 
-    # 使用预训练的分支模型进行融合训练
-    trained_model = train_fusion_model_progressive(
-        model=fusion_model,  # 传入FRAMCAOCNNFusion实例
-        train_loader=train_loader,
-        val_loader=val_loader,
-        cnn_state_dict='checkpoints/cnn/best_model.pt',
-        lstm_state_dict='checkpoints/mcao_lstm/best_model.pt',
-        n_epochs=args.fusion_epochs,
-        device=device,
-        learning_rate=args.fusion_lr,
-        checkpoint_dir='checkpoints/fusion'
-    )
+    for epoch in range(args.fusion_epochs):
+        train_sampler.set_epoch(epoch)
+        fusion_model = train_fusion_model_progressive(
+            model=fusion_model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            cnn_state_dict='checkpoints/cnn/best_model.pt',
+            lstm_state_dict='checkpoints/mcao_lstm/best_model.pt',
+            n_epochs=1,
+            device=device,
+            learning_rate=args.fusion_lr,
+            checkpoint_dir='checkpoints/fusion' if rank == 0 else None
+        )
     
     # 保存最终模型
-    torch.save(
-        trained_model.state_dict(),
-        'checkpoints/final_model.pt'
-    )
+    if rank == 0:
+        torch.save(
+            fusion_model.state_dict(),
+            'checkpoints/final_model.pt'
+        )
+    
+    cleanup()
     
 if __name__ == "__main__":
     args = get_args()
