@@ -164,8 +164,11 @@ def train_cnn_branch(model, train_loader, val_loader,
                     n_epochs=30, device='cuda', learning_rate=0.0001,
                     checkpoint_dir='checkpoints/cnn'):
     """训练CNN分支"""
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    writer = SummaryWriter('runs/cnn_branch')
+    # 获取当前进程的rank
+    rank = dist.get_rank()
+    if rank == 0:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        writer = SummaryWriter('runs/cnn_branch')
     
     # 使用MSE损失
     criterion = nn.MSELoss()
