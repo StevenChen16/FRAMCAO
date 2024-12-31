@@ -210,44 +210,47 @@ def train_cnn_branch(model, train_loader, val_loader,
             total_loss += loss.item()
             pbar.set_postfix({'loss': loss.item()})
             
-            writer.add_scalar('Train/Loss', loss.item(), epoch * len(train_loader) + batch_idx)
+            if rank == 0:  # 只在主进程记录训练损失
+                writer.add_scalar('Train/Loss', loss.item(), epoch * len(train_loader) + batch_idx)
         
         avg_loss = total_loss / len(train_loader)
-        print(f"\nEpoch {epoch+1} Avg Training Loss: {avg_loss:.4f}")
+        if rank == 0:  # 只在主进程打印
+            print(f"\nEpoch {epoch+1} Avg Training Loss: {avg_loss:.4f}")
         
         # 验证
-        model.eval()
-        val_loss = 0
-        
-        with torch.no_grad():
-            for batch in val_loader:
-                feature_seq = batch['feature_seq'].to(device)
-                target = batch['target'].to(device)
-                
-                predictions, _ = model(feature_seq)
-                loss = criterion(predictions[:, -1], target)
-                val_loss += loss.item()
-        
-        val_loss /= len(val_loader)
-        writer.add_scalar('Validation/Loss', val_loss, epoch)
-        
-        print(f"Validation Loss: {val_loss:.4f}")
-        
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_model_state = model.state_dict()
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_loss,
-            }, os.path.join(checkpoint_dir, 'best_model.pt'))
-            patience_counter = 0
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print("Early stopping triggered")
-                break
+        if val_loader is not None:  # 只在有验证集的进程(rank 0)进行验证
+            model.eval()
+            val_loss = 0
+            
+            with torch.no_grad():
+                for batch in val_loader:
+                    feature_seq = batch['feature_seq'].to(device)
+                    target = batch['target'].to(device)
+                    
+                    predictions, _ = model(feature_seq)
+                    loss = criterion(predictions[:, -1], target)
+                    val_loss += loss.item()
+            
+            val_loss /= len(val_loader)
+            if rank == 0:  # 只在主进程记录和打印验证损失
+                writer.add_scalar('Validation/Loss', val_loss, epoch)
+                print(f"Validation Loss: {val_loss:.4f}")
+            
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_model_state = model.state_dict()
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'val_loss': val_loss,
+                    }, os.path.join(checkpoint_dir, 'best_model.pt'))
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= patience:
+                        print("Early stopping triggered")
+                        break
     
     if best_model_state is not None:
         model.load_state_dict(best_model_state)
